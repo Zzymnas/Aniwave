@@ -25,7 +25,7 @@ class Provider {
 
     getSettings(): Settings {
         return {
-            episodeServers: ["Vidplay", "BYFMS", "DGHG"],
+            episodeServers: ["DGHG", "Vidplay", "BYFMS"],
             supportsDub: true,
         }
     }
@@ -163,16 +163,18 @@ class Provider {
 
         // Map server name to sv-id
         var serverLower = server.toLowerCase()
-        var svId = "4" // default to Vidplay
+        var svId = "2" // default to DGHG (DoodStream) — most reliable
         if (serverLower.indexOf("byfms") !== -1) svId = "1"
-        else if (serverLower.indexOf("dghg") !== -1) svId = "2"
         else if (serverLower.indexOf("vidplay") !== -1) svId = "4"
+        else if (serverLower.indexOf("dghg") !== -1) svId = "2"
 
         // Determine sub or dub type
         var dataType = "sub"
 
-        // Use ChromeDP to load the episode page and extract the iframe src
-        // The data-link-id is encoded and requires the site's JS to decode it
+        // Use ChromeDP to:
+        // 1. Load the episode page and click the desired server
+        // 2. Extract the iframe embed URL
+        // 3. Navigate to the embed URL to extract the actual video source
         var browser = await ChromeDP.newBrowser()
 
         try {
@@ -190,133 +192,80 @@ class Provider {
             await browser.sleep(3000)
             await browser.waitVisible("iframe")
 
-            // Extract the iframe src
+            // Extract the iframe src (embed player URL)
             var iframeSrc = await browser.evaluate(
                 "(function() { var f = document.querySelector('iframe'); return f ? f.src : ''; })()"
             )
 
-            if (iframeSrc && typeof iframeSrc === "string" && iframeSrc.length > 0) {
-                result.videoSources.push({
-                    url: iframeSrc,
-                    type: "m3u8" as VideoSourceType,
-                    quality: "auto",
-                    subtitles: [],
-                })
-            }
-        } catch (e) {
-            console.error("ChromeDP error: " + e)
-        } finally {
-            await browser.close()
-        }
-
-        return result
-    }
-}
-            let subOrDub: SubOrDub = "sub"
-            if (subText && dubText) {
-                subOrDub = "both"
-            } else if (dubText && !subText) {
-                subOrDub = "dub"
+            if (!iframeSrc || typeof iframeSrc !== "string" || iframeSrc.length === 0) {
+                await browser.close()
+                return result
             }
 
-            results.push({
-                id: slug,
-                title: title,
-                url: `${this.baseUrl}/watch/${slug}`,
-                subOrDub: subOrDub,
-            })
-        })
+            // Step 2: Navigate to the embed URL to extract the actual video source
+            // The embed player (DoodStream/playmogo, echovideo, etc.) loads a
+            // video element with a direct CDN URL
+            await browser.navigate(iframeSrc as string)
+            await browser.sleep(5000)
 
-        return results
-    }
-
-    // ─── Find Episodes ──────────────────────────────────────────────────
-    async findEpisodes(id: string): Promise<EpisodeDetails[]> {
-        // Load the watch page — episodes are rendered inline in the HTML
-        const watchUrl = `${this.baseUrl}/watch/${id}`
-        const res = await fetch(watchUrl)
-        if (!res.ok) return []
-
-        const html = res.text()
-        const $ = LoadDoc(html)
-        const episodes: EpisodeDetails[] = []
-
-        // Episodes: ul.ep-range > li > a[data-num][href]
-        $(".ep-range li a").each((_: number, el: DocSelection) => {
-            const numStr = el.attr("data-num") || "0"
-            const num = parseInt(numStr, 10)
-            const href = el.attr("href") || ""
-            const title = el.parent().attr("title") || ""
-
-            if (isNaN(num) || num === 0) return
-
-            // Use the full path as the episode ID
-            const epPath = href.startsWith("/") ? href : `/watch/${id}/ep-${num}`
-
-            episodes.push({
-                id: epPath,
-                number: num,
-                url: `${this.baseUrl}${epPath}`,
-                title: title || `Episode ${num}`,
-            })
-        })
-
-        // Sort by episode number
-        episodes.sort((a, b) => a.number - b.number)
-        return episodes
-    }
-
-    // ─── Find Episode Server ────────────────────────────────────────────
-    async findEpisodeServer(
-        episode: EpisodeDetails,
-        server: string,
-    ): Promise<EpisodeServer> {
-        const result: EpisodeServer = {
-            server: server,
-            headers: { Referer: this.baseUrl },
-            videoSources: [],
-        }
-
-        // The data-link-id is encoded/compressed and requires the site's own JS to
-        // decode it into an embed URL. We use ChromeDP to load the page in a headless
-        // browser, click the desired server, and read the resulting iframe src.
-        const browser = await ChromeDP.newBrowser()
-
-        try {
-            // Navigate to the episode page
-            const pageUrl = episode.url || `${this.baseUrl}${episode.id}`
-            await browser.navigate(pageUrl)
-
-            // Wait for the servers section to load
-            await browser.waitVisible(".servers .type li")
-
-            // Map server name to sv-id
-            const serverLower = server.toLowerCase()
-            let svId = "4" // default to Vidplay
-            if (serverLower.includes("byfms")) svId = "1"
-            else if (serverLower.includes("dghg")) svId = "2"
-            else if (serverLower.includes("vidplay")) svId = "4"
-
-            // Click the server button (sub type)
-            const clickSelector = `.servers .type[data-type="sub"] li[data-sv-id="${svId}"]`
-            await browser.click(clickSelector)
-
-            // Wait for the iframe to appear
-            await browser.sleep(2000)
-            await browser.waitVisible("iframe")
-
-            // Extract the iframe src
-            const iframeSrc = await browser.evaluate(
-                `(function() { var f = document.querySelector('iframe'); return f ? f.src : ''; })()`
+            // Try to extract the video element source
+            var videoSrc = await browser.evaluate(
+                "(function() { var v = document.querySelector('video'); if (v) { return v.src || v.currentSrc || ''; } return ''; })()"
             )
 
-            if (iframeSrc && typeof iframeSrc === "string" && iframeSrc.length > 0) {
+            if (videoSrc && typeof videoSrc === "string" && videoSrc.length > 0) {
+                // Direct video URL found (e.g. from DoodStream/DGHG)
                 result.videoSources.push({
-                    url: iframeSrc,
-                    type: "m3u8" as VideoSourceType,
+                    url: videoSrc as string,
+                    type: "mp4" as VideoSourceType,
                     quality: "auto",
                     subtitles: [],
                 })
+                // Set Referer to the embed domain for the CDN to accept the request
+                var embedUrl = iframeSrc as string
+                try {
+                    var embedHost = embedUrl.split("/")[2] || ""
+                    if (embedHost) {
+                        result.headers = { Referer: "https://" + embedHost + "/" }
+                    }
+                } catch (e2) {
+                    // keep default referer
+                }
+            } else {
+                // No video element — try to find m3u8 source in page scripts
+                var hlsSrc = await browser.evaluate(
+                    "(function() { " +
+                    "var scripts = document.querySelectorAll('script'); " +
+                    "for (var i = 0; i < scripts.length; i++) { " +
+                    "  var t = scripts[i].textContent || ''; " +
+                    "  var m = t.match(/[\"'](https?:\\/\\/[^\"']*\\.m3u8[^\"']*)[\"']/); " +
+                    "  if (m) return m[1]; " +
+                    "} " +
+                    "return ''; " +
+                    "})()"
+                )
+
+                if (hlsSrc && typeof hlsSrc === "string" && hlsSrc.length > 0) {
+                    result.videoSources.push({
+                        url: hlsSrc as string,
+                        type: "m3u8" as VideoSourceType,
+                        quality: "auto",
+                        subtitles: [],
+                    })
+                } else {
+                    // Last resort: check for any source element in video tag
+                    var sourceSrc = await browser.evaluate(
+                        "(function() { var s = document.querySelector('video source'); return s ? (s.src || '') : ''; })()"
+                    )
+                    if (sourceSrc && typeof sourceSrc === "string" && sourceSrc.length > 0) {
+                        result.videoSources.push({
+                            url: sourceSrc as string,
+                            type: "mp4" as VideoSourceType,
+                            quality: "auto",
+                            subtitles: [],
+                        })
+                    }
+                }
             }
         } catch (e) {
             console.error("ChromeDP error: " + e)
