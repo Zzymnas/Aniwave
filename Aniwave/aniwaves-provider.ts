@@ -4,24 +4,20 @@
 /**
  * Seanime Online Streaming Provider for aniwaves.ru
  *
- * Site structure:
- *   Search page:  /filter?keyword={query}
- *     Items:      div.item > div.inner > div.ani.poster[data-tip="{id}"]
- *                   > a[href="/watch/{slug}"] with img
- *                 div.info > a.name.d-title[href][data-jp]
- *                 span.ep-status.sub / span.ep-status.dub for sub/dub counts
+ * Endpoints used:
+ *   AJAX Search:    GET /ajax/anime/search?keyword={query}
+ *     Returns JSON: {status: 200, result: {html: "<div class='scaff items'><a class='item' href='/watch/{slug}'>..."}}
  *
- *   Watch page:   /watch/{slug}  (redirects to /watch/{slug}/ep-1)
- *     Data ID:    div.layout-page-watchtv[data-id="{animeId}"]
- *     Episodes:   ul.ep-range > li > a[data-num][data-ids][data-sub][data-dub][href]
- *     Servers:    div.servers > div.type[data-type="sub"|"dub"]
- *                   > li[data-sv-id][data-link-id][data-ep-id]
- *                 Server names: Vidplay (sv-id=4), BYFMS (sv-id=1), DGHG (sv-id=2)
+ *   Watch page:     GET /watch/{slug}
+ *     Raw HTML contains JSON-LD with episode counts and data-id attribute for anime ID.
+ *     Episodes are NOT in raw HTML (loaded by JS), but episode count is in JSON-LD
+ *     ("Subbed episodes released" / "Dubbed episodes released").
+ *     URL pattern: /watch/{slug}/ep-{num}
  *
- *   Video source: data-link-id is encoded/compressed. The site's JS decodes it
- *                 and loads an iframe pointing to an embed player
- *                 (e.g. play.echovideo.ru, weneverbeenfree.com).
- *                 We use ChromeDP to render the page and extract the iframe src.
+ *   AJAX Servers:   GET /ajax/server/list?servers={animeId}&eps={epNum}
+ *     Returns JSON: {status: 200, result: "<div class='servers'>..."}
+ *     Server sv-ids: Vidplay=4, BYFMS=1, DGHG=2
+ *     data-link-id is encoded — requires ChromeDP to decode via the site's JS.
  */
 
 class Provider {
@@ -39,30 +35,183 @@ class Provider {
         const query = opts.query || opts.media.englishTitle || opts.media.romajiTitle || ""
         if (!query) return []
 
-        const url = `${this.baseUrl}/filter?keyword=${encodeURIComponent(query)}`
+        const url = this.baseUrl + "/ajax/anime/search?keyword=" + encodeURIComponent(query)
         const res = await fetch(url)
         if (!res.ok) return []
 
-        const html = res.text()
-        const $ = LoadDoc(html)
-        const results: SearchResult[] = []
+        var data: any
+        try {
+            data = res.json()
+        } catch (e) {
+            return []
+        }
 
-        $(".item").each((_: number, el: DocSelection) => {
-            // Title and link
-            const nameLink = el.find("a.name.d-title")
-            const title = nameLink.text().trim()
-            const href = nameLink.attr("href") || ""
+        if (!data || !data.result || !data.result.html) return []
+
+        var $ = LoadDoc(data.result.html)
+        var results: SearchResult[] = []
+
+        $("a.item").each(function (_: number, el: DocSelection) {
+            var href = el.attr("href") || ""
+            var nameEl = el.find(".name.d-title")
+            var title = nameEl.text().trim()
+            var jpTitle = nameEl.attr("data-jp") || ""
 
             if (!title || !href) return
 
             // Extract slug from href: /watch/naruto-76396
-            const slug = href.replace(/^\/watch\//, "")
+            var slug = href.replace(/^\/watch\//, "")
             if (!slug) return
 
-            // Detect sub/dub from ep-status spans
-            const subText = el.find(".ep-status.sub span").text().trim()
-            const dubText = el.find(".ep-status.dub span").text().trim()
+            results.push({
+                id: slug,
+                title: title,
+                url: "https://aniwaves.ru/watch/" + slug,
+                subOrDub: "sub" as SubOrDub,
+            })
+        })
 
+        return results
+    }
+
+    // ─── Find Episodes ──────────────────────────────────────────────────
+    async findEpisodes(id: string): Promise<EpisodeDetails[]> {
+        // Fetch the watch page — episodes are loaded by JS but the raw HTML
+        // contains JSON-LD structured data with the episode count, and the
+        // data-id attribute with the numeric anime ID.
+        var watchUrl = this.baseUrl + "/watch/" + id
+        var res = await fetch(watchUrl)
+        if (!res.ok) return []
+
+        var html = res.text()
+        var episodes: EpisodeDetails[] = []
+
+        // Extract episode count from JSON-LD
+        // Look for: "name": "Subbed episodes released", "value": N
+        var subMatch = html.match(/"Subbed episodes released"[^}]*"value"\s*:\s*(\d+)/)
+        var dubMatch = html.match(/"Dubbed episodes released"[^}]*"value"\s*:\s*(\d+)/)
+
+        var epCount = 0
+        if (subMatch) {
+            epCount = parseInt(subMatch[1], 10)
+        }
+        if (dubMatch) {
+            var dubCount = parseInt(dubMatch[1], 10)
+            if (dubCount > epCount) {
+                epCount = dubCount
+            }
+        }
+
+        if (epCount === 0) {
+            // Fallback: try to extract from the page using ChromeDP
+            var browser = await ChromeDP.newBrowser()
+            try {
+                await browser.navigate(watchUrl)
+                await browser.waitVisible(".ep-range li a")
+                var countStr = await browser.evaluate(
+                    "(function() { return document.querySelectorAll('.ep-range li a').length.toString(); })()"
+                )
+                epCount = parseInt(countStr as string, 10) || 0
+            } catch (e) {
+                // ignore
+            } finally {
+                await browser.close()
+            }
+        }
+
+        // Generate episode list from count and URL pattern
+        for (var i = 1; i <= epCount; i++) {
+            var epPath = "/watch/" + id + "/ep-" + i
+            episodes.push({
+                id: epPath,
+                number: i,
+                url: this.baseUrl + epPath,
+                title: "Episode " + i,
+            })
+        }
+
+        return episodes
+    }
+
+    // ─── Find Episode Server ────────────────────────────────────────────
+    async findEpisodeServer(
+        episode: EpisodeDetails,
+        server: string,
+    ): Promise<EpisodeServer> {
+        var result: EpisodeServer = {
+            server: server,
+            headers: { Referer: this.baseUrl },
+            videoSources: [],
+        }
+
+        // Extract anime ID and episode number from the episode ID
+        // Episode ID format: /watch/{slug}/ep-{num}
+        // Slug format: {name}-{animeId} e.g. naruto-76396
+        var epIdStr = episode.id || ""
+        var epNumMatch = epIdStr.match(/ep-(\d+)$/)
+        var epNum = epNumMatch ? epNumMatch[1] : "1"
+
+        // Extract slug from episode ID
+        var slugMatch = epIdStr.match(/\/watch\/([^\/]+)/)
+        var slug = slugMatch ? slugMatch[1] : ""
+
+        // Extract numeric anime ID from slug (last number after last hyphen)
+        var animeIdMatch = slug.match(/-(\d+)$/)
+        var animeId = animeIdMatch ? animeIdMatch[1] : ""
+
+        if (!animeId) return result
+
+        // Map server name to sv-id
+        var serverLower = server.toLowerCase()
+        var svId = "4" // default to Vidplay
+        if (serverLower.indexOf("byfms") !== -1) svId = "1"
+        else if (serverLower.indexOf("dghg") !== -1) svId = "2"
+        else if (serverLower.indexOf("vidplay") !== -1) svId = "4"
+
+        // Determine sub or dub type
+        var dataType = "sub"
+
+        // Use ChromeDP to load the episode page and extract the iframe src
+        // The data-link-id is encoded and requires the site's JS to decode it
+        var browser = await ChromeDP.newBrowser()
+
+        try {
+            var pageUrl = episode.url || (this.baseUrl + epIdStr)
+            await browser.navigate(pageUrl)
+
+            // Wait for the servers section to load
+            await browser.waitVisible(".servers .type li")
+
+            // Click the desired server
+            var clickSelector = '.servers .type[data-type="' + dataType + '"] li[data-sv-id="' + svId + '"]'
+            await browser.click(clickSelector)
+
+            // Wait for the iframe to appear
+            await browser.sleep(3000)
+            await browser.waitVisible("iframe")
+
+            // Extract the iframe src
+            var iframeSrc = await browser.evaluate(
+                "(function() { var f = document.querySelector('iframe'); return f ? f.src : ''; })()"
+            )
+
+            if (iframeSrc && typeof iframeSrc === "string" && iframeSrc.length > 0) {
+                result.videoSources.push({
+                    url: iframeSrc,
+                    type: "m3u8" as VideoSourceType,
+                    quality: "auto",
+                    subtitles: [],
+                })
+            }
+        } catch (e) {
+            console.error("ChromeDP error: " + e)
+        } finally {
+            await browser.close()
+        }
+
+        return result
+    }
+}
             let subOrDub: SubOrDub = "sub"
             if (subText && dubText) {
                 subOrDub = "both"
