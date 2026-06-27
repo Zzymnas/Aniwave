@@ -2,22 +2,18 @@
 /// <reference path="./core.d.ts" />
 
 /**
- * Seanime Online Streaming Provider for aniwaves.ru
+ * Seanime Online Streaming Provider for aniwaves.ru (v3.0.0)
+ *
+ * Fully fetch-based — NO ChromeDP dependency.
  *
  * Endpoints used:
  *   AJAX Search:    GET /ajax/anime/search?keyword={query}
- *     Returns JSON: {status: 200, result: {html: "<div class='scaff items'><a class='item' href='/watch/{slug}'>..."}}
- *
- *   Watch page:     GET /watch/{slug}
- *     Raw HTML contains JSON-LD with episode counts and data-id attribute for anime ID.
- *     Episodes are NOT in raw HTML (loaded by JS), but episode count is in JSON-LD
- *     ("Subbed episodes released" / "Dubbed episodes released").
- *     URL pattern: /watch/{slug}/ep-{num}
- *
+ *   Watch page:     GET /watch/{slug}  (JSON-LD for episode count)
  *   AJAX Servers:   GET /ajax/server/list?servers={animeId}&eps={epNum}
- *     Returns JSON: {status: 200, result: "<div class='servers'>..."}
- *     Server sv-ids: Vidplay=4, BYFMS=1, DGHG=2
- *     data-link-id is encoded — requires ChromeDP to decode via the site's JS.
+ *   AJAX Sources:   GET /ajax/sources?id={data-link-id}&asi=0&autoPlay=0
+ *     Returns JSON: {status: 200, result: {url: "https://myvidplay.com/e/{id}"}}
+ *   DoodStream:     GET {embedUrl} → parse pass_md5 → GET /pass_md5/{hash}/{token}
+ *     Returns CDN base URL → append random token → final mp4 video URL
  */
 
 class Provider {
@@ -25,7 +21,7 @@ class Provider {
 
     getSettings(): Settings {
         return {
-            episodeServers: ["DGHG", "Vidplay", "BYFMS"],
+            episodeServers: ["DGHG"],
             supportsDub: true,
         }
     }
@@ -55,11 +51,9 @@ class Provider {
             var href = el.attr("href") || ""
             var nameEl = el.find(".name.d-title")
             var title = nameEl.text().trim()
-            var jpTitle = nameEl.attr("data-jp") || ""
 
             if (!title || !href) return
 
-            // Extract slug from href: /watch/naruto-76396
             var slug = href.replace(/^\/watch\//, "")
             if (!slug) return
 
@@ -76,9 +70,6 @@ class Provider {
 
     // ─── Find Episodes ──────────────────────────────────────────────────
     async findEpisodes(id: string): Promise<EpisodeDetails[]> {
-        // Fetch the watch page — episodes are loaded by JS but the raw HTML
-        // contains JSON-LD structured data with the episode count, and the
-        // data-id attribute with the numeric anime ID.
         var watchUrl = this.baseUrl + "/watch/" + id
         var res = await fetch(watchUrl)
         if (!res.ok) return []
@@ -87,7 +78,6 @@ class Provider {
         var episodes: EpisodeDetails[] = []
 
         // Extract episode count from JSON-LD
-        // Look for: "name": "Subbed episodes released", "value": N
         var subMatch = html.match(/"Subbed episodes released"[^}]*"value"\s*:\s*(\d+)/)
         var dubMatch = html.match(/"Dubbed episodes released"[^}]*"value"\s*:\s*(\d+)/)
 
@@ -102,24 +92,8 @@ class Provider {
             }
         }
 
-        if (epCount === 0) {
-            // Fallback: try to extract from the page using ChromeDP
-            var browser = await ChromeDP.newBrowser()
-            try {
-                await browser.navigate(watchUrl)
-                await browser.waitVisible(".ep-range li a")
-                var countStr = await browser.evaluate(
-                    "(function() { return document.querySelectorAll('.ep-range li a').length.toString(); })()"
-                )
-                epCount = parseInt(countStr as string, 10) || 0
-            } catch (e) {
-                // ignore
-            } finally {
-                await browser.close()
-            }
-        }
+        if (epCount === 0) return []
 
-        // Generate episode list from count and URL pattern
         for (var i = 1; i <= epCount; i++) {
             var epPath = "/watch/" + id + "/ep-" + i
             episodes.push({
@@ -144,133 +118,132 @@ class Provider {
             videoSources: [],
         }
 
-        // Extract anime ID and episode number from the episode ID
-        // Episode ID format: /watch/{slug}/ep-{num}
-        // Slug format: {name}-{animeId} e.g. naruto-76396
+        // Parse episode ID: /watch/{slug}/ep-{num}
         var epIdStr = episode.id || ""
         var epNumMatch = epIdStr.match(/ep-(\d+)$/)
         var epNum = epNumMatch ? epNumMatch[1] : "1"
 
-        // Extract slug from episode ID
         var slugMatch = epIdStr.match(/\/watch\/([^\/]+)/)
         var slug = slugMatch ? slugMatch[1] : ""
 
-        // Extract numeric anime ID from slug (last number after last hyphen)
         var animeIdMatch = slug.match(/-(\d+)$/)
         var animeId = animeIdMatch ? animeIdMatch[1] : ""
 
         if (!animeId) return result
 
         // Map server name to sv-id
+        var svId = "2" // DGHG default
         var serverLower = server.toLowerCase()
-        var svId = "2" // default to DGHG (DoodStream) — most reliable
         if (serverLower.indexOf("byfms") !== -1) svId = "1"
         else if (serverLower.indexOf("vidplay") !== -1) svId = "4"
         else if (serverLower.indexOf("dghg") !== -1) svId = "2"
 
-        // Determine sub or dub type
-        var dataType = "sub"
-
-        // Use ChromeDP to:
-        // 1. Load the episode page and click the desired server
-        // 2. Extract the iframe embed URL
-        // 3. Navigate to the embed URL to extract the actual video source
-        var browser = await ChromeDP.newBrowser()
-
         try {
-            var pageUrl = episode.url || (this.baseUrl + epIdStr)
-            await browser.navigate(pageUrl)
+            // Step 1: Fetch server list to get data-link-id
+            var serverListUrl = this.baseUrl + "/ajax/server/list?servers=" + animeId + "&eps=" + epNum
+            var slRes = await fetch(serverListUrl)
+            if (!slRes.ok) return result
 
-            // Wait for the servers section to load
-            await browser.waitVisible(".servers .type li")
-
-            // Click the desired server
-            var clickSelector = '.servers .type[data-type="' + dataType + '"] li[data-sv-id="' + svId + '"]'
-            await browser.click(clickSelector)
-
-            // Wait for the iframe to appear
-            await browser.sleep(3000)
-            await browser.waitVisible("iframe")
-
-            // Extract the iframe src (embed player URL)
-            var iframeSrc = await browser.evaluate(
-                "(function() { var f = document.querySelector('iframe'); return f ? f.src : ''; })()"
-            )
-
-            if (!iframeSrc || typeof iframeSrc !== "string" || iframeSrc.length === 0) {
-                await browser.close()
+            var slData: any
+            try {
+                slData = slRes.json()
+            } catch (e) {
                 return result
             }
 
-            // Step 2: Navigate to the embed URL to extract the actual video source
-            // The embed player (DoodStream/playmogo, echovideo, etc.) loads a
-            // video element with a direct CDN URL
-            await browser.navigate(iframeSrc as string)
-            await browser.sleep(5000)
+            if (!slData || !slData.result) return result
 
-            // Try to extract the video element source
-            var videoSrc = await browser.evaluate(
-                "(function() { var v = document.querySelector('video'); if (v) { return v.src || v.currentSrc || ''; } return ''; })()"
-            )
+            var $sl = LoadDoc(slData.result)
+            var dataLinkId = ""
 
-            if (videoSrc && typeof videoSrc === "string" && videoSrc.length > 0) {
-                // Direct video URL found (e.g. from DoodStream/DGHG)
-                result.videoSources.push({
-                    url: videoSrc as string,
-                    type: "mp4" as VideoSourceType,
-                    quality: "auto",
-                    subtitles: [],
-                })
-                // Set Referer to the embed domain for the CDN to accept the request
-                var embedUrl = iframeSrc as string
-                try {
-                    var embedHost = embedUrl.split("/")[2] || ""
-                    if (embedHost) {
-                        result.headers = { Referer: "https://" + embedHost + "/" }
-                    }
-                } catch (e2) {
-                    // keep default referer
+            // Find the matching server's data-link-id
+            // Try sub type first
+            $sl('li[data-sv-id="' + svId + '"]').each(function (_: number, el: DocSelection) {
+                var lid = el.attr("data-link-id") || ""
+                if (lid && !dataLinkId) {
+                    dataLinkId = lid
                 }
-            } else {
-                // No video element — try to find m3u8 source in page scripts
-                var hlsSrc = await browser.evaluate(
-                    "(function() { " +
-                    "var scripts = document.querySelectorAll('script'); " +
-                    "for (var i = 0; i < scripts.length; i++) { " +
-                    "  var t = scripts[i].textContent || ''; " +
-                    "  var m = t.match(/[\"'](https?:\\/\\/[^\"']*\\.m3u8[^\"']*)[\"']/); " +
-                    "  if (m) return m[1]; " +
-                    "} " +
-                    "return ''; " +
-                    "})()"
-                )
+            })
 
-                if (hlsSrc && typeof hlsSrc === "string" && hlsSrc.length > 0) {
-                    result.videoSources.push({
-                        url: hlsSrc as string,
-                        type: "m3u8" as VideoSourceType,
-                        quality: "auto",
-                        subtitles: [],
-                    })
-                } else {
-                    // Last resort: check for any source element in video tag
-                    var sourceSrc = await browser.evaluate(
-                        "(function() { var s = document.querySelector('video source'); return s ? (s.src || '') : ''; })()"
-                    )
-                    if (sourceSrc && typeof sourceSrc === "string" && sourceSrc.length > 0) {
-                        result.videoSources.push({
-                            url: sourceSrc as string,
-                            type: "mp4" as VideoSourceType,
-                            quality: "auto",
-                            subtitles: [],
-                        })
-                    }
-                }
+            if (!dataLinkId) return result
+
+            // Step 2: Fetch embed URL via ajax/sources
+            var sourcesUrl = this.baseUrl + "/ajax/sources?id=" + encodeURIComponent(dataLinkId) + "&asi=0&autoPlay=0"
+            var srcRes = await fetch(sourcesUrl)
+            if (!srcRes.ok) return result
+
+            var srcData: any
+            try {
+                srcData = srcRes.json()
+            } catch (e) {
+                return result
             }
+
+            if (!srcData || srcData.status !== 200 || !srcData.result || !srcData.result.url) return result
+
+            var embedUrl = srcData.result.url as string
+
+            // Step 3: Fetch the embed page (DoodStream) to get pass_md5 URL
+            var embedRes = await fetch(embedUrl, {
+                headers: { Referer: this.baseUrl + "/" },
+            })
+            if (!embedRes.ok) return result
+
+            var embedHtml = embedRes.text()
+
+            // Extract the pass_md5 URL pattern from the embed page
+            // Pattern in script: $.get('/pass_md5/{hash}/{token}', function(data) { ... })
+            var passMatch = embedHtml.match(/\/pass_md5\/[a-zA-Z0-9\-]+\/[a-zA-Z0-9]+/)
+            if (!passMatch) return result
+
+            var passMd5Path = passMatch[0]
+
+            // Extract the token (last segment of pass_md5 path)
+            var pathParts = passMd5Path.split("/")
+            var passToken = pathParts[pathParts.length - 1]
+
+            // Determine the embed host for the pass_md5 request
+            var embedHost = ""
+            try {
+                var embedParts = embedUrl.split("/")
+                embedHost = embedParts[0] + "//" + embedParts[2]
+            } catch (e) {
+                embedHost = "https://playmogo.com"
+            }
+
+            // Step 4: Fetch pass_md5 to get CDN base URL
+            var passMd5Url = embedHost + passMd5Path
+            var passRes = await fetch(passMd5Url, {
+                headers: { Referer: embedUrl },
+            })
+            if (!passRes.ok) return result
+
+            var cdnBaseUrl = passRes.text().trim()
+            if (!cdnBaseUrl || cdnBaseUrl.indexOf("http") !== 0) return result
+
+            // Step 5: Construct final video URL
+            // makePlay() generates: 10 random alphanumeric chars + ?token={token}&expiry={timestamp}
+            var chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+            var randomStr = ""
+            for (var r = 0; r < 10; r++) {
+                randomStr += chars.charAt(Math.floor(Math.random() * chars.length))
+            }
+
+            var expiry = Date.now()
+            var videoUrl = cdnBaseUrl + randomStr + "?token=" + passToken + "&expiry=" + expiry
+
+            result.videoSources.push({
+                url: videoUrl,
+                type: "mp4" as VideoSourceType,
+                quality: "auto",
+                subtitles: [],
+            })
+
+            // Set Referer to the embed host for CDN to accept the request
+            result.headers = { Referer: embedHost + "/" }
+
         } catch (e) {
-            console.error("ChromeDP error: " + e)
-        } finally {
-            await browser.close()
+            // Silent fail — return empty result
         }
 
         return result
