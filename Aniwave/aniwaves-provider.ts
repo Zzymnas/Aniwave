@@ -4,29 +4,32 @@
 /**
  * Seanime Online Streaming Provider for aniwaves.ru
  *
- * This extension scrapes aniwaves.ru (an aniwave/9anime-style site)
- * to provide anime search, episode listing, and video source extraction.
+ * Site structure:
+ *   Search page:  /filter?keyword={query}
+ *     Items:      div.item > div.inner > div.ani.poster[data-tip="{id}"]
+ *                   > a[href="/watch/{slug}"] with img
+ *                 div.info > a.name.d-title[href][data-jp]
+ *                 span.ep-status.sub / span.ep-status.dub for sub/dub counts
  *
- * Site structure (aniwave pattern):
- *   Search:     GET /filter?keyword={query}
- *   Anime page: GET /watch/{slug}
- *   Episodes:   GET /ajax/episode/list/{anime-data-id}
- *   Servers:    GET /ajax/server/list/{episode-data-id}
- *   Sources:    GET /ajax/sources/{server-data-id}
+ *   Watch page:   /watch/{slug}  (redirects to /watch/{slug}/ep-1)
+ *     Data ID:    div.layout-page-watchtv[data-id="{animeId}"]
+ *     Episodes:   ul.ep-range > li > a[data-num][data-ids][data-sub][data-dub][href]
+ *     Servers:    div.servers > div.type[data-type="sub"|"dub"]
+ *                   > li[data-sv-id][data-link-id][data-ep-id]
+ *                 Server names: Vidplay (sv-id=4), BYFMS (sv-id=1), DGHG (sv-id=2)
+ *
+ *   Video source: data-link-id is encoded/compressed. The site's JS decodes it
+ *                 and loads an iframe pointing to an embed player
+ *                 (e.g. play.echovideo.ru, weneverbeenfree.com).
+ *                 We use ChromeDP to render the page and extract the iframe src.
  */
 
 class Provider {
     baseUrl = "https://aniwaves.ru"
-    headers = {
-        "Referer": "https://aniwaves.ru/",
-        "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "X-Requested-With": "XMLHttpRequest",
-    }
 
     getSettings(): Settings {
         return {
-            episodeServers: ["vidplay", "mycloud", "filemoon", "mp4upload"],
+            episodeServers: ["Vidplay", "BYFMS", "DGHG"],
             supportsDub: true,
         }
     }
@@ -37,176 +40,77 @@ class Provider {
         if (!query) return []
 
         const url = `${this.baseUrl}/filter?keyword=${encodeURIComponent(query)}`
-        const res = await fetch(url, { headers: this.headers })
+        const res = await fetch(url)
         if (!res.ok) return []
 
-        const html = await res.text()
+        const html = res.text()
         const $ = LoadDoc(html)
         const results: SearchResult[] = []
 
-        // Aniwave sites use .flw-item for each anime card
-        $(".flw-item").each((_: number, el: any) => {
-            const anchor = $(el).find(".film-name a, .dynamic-name, h3 a, h2 a")
-            const title = anchor.text().trim()
-            const href = anchor.attr("href") || ""
+        $(".item").each((_: number, el: DocSelection) => {
+            // Title and link
+            const nameLink = el.find("a.name.d-title")
+            const title = nameLink.text().trim()
+            const href = nameLink.attr("href") || ""
 
             if (!title || !href) return
 
-            // Extract the slug/ID from the href (e.g. /watch/one-piece-81553)
-            const id = href.replace(/^\/watch\//, "").replace(/^\//, "")
+            // Extract slug from href: /watch/naruto-76396
+            const slug = href.replace(/^\/watch\//, "")
+            if (!slug) return
 
-            // Detect sub/dub from tick items or labels
-            const tickItems = $(el).find(".tick-item, .tick").text().toLowerCase()
+            // Detect sub/dub from ep-status spans
+            const subText = el.find(".ep-status.sub span").text().trim()
+            const dubText = el.find(".ep-status.dub span").text().trim()
+
             let subOrDub: SubOrDub = "sub"
-            if (tickItems.includes("dub") && tickItems.includes("sub")) {
+            if (subText && dubText) {
                 subOrDub = "both"
-            } else if (tickItems.includes("dub")) {
+            } else if (dubText && !subText) {
                 subOrDub = "dub"
             }
 
             results.push({
-                id: id,
+                id: slug,
                 title: title,
-                url: `${this.baseUrl}/watch/${id}`,
+                url: `${this.baseUrl}/watch/${slug}`,
                 subOrDub: subOrDub,
             })
         })
-
-        // Fallback: try alternative card selectors if .flw-item didn't match
-        if (results.length === 0) {
-            $(".anime-list .item, .film_list-wrap .flw-item, .film-list .item, .list-item, .anime-block a").each(
-                (_: number, el: any) => {
-                    const anchor = $(el).find("a[href*='/watch/']").length
-                        ? $(el).find("a[href*='/watch/']")
-                        : $(el)
-                    const title =
-                        anchor.attr("title") ||
-                        $(el).find(".film-name, .name, .title, h3, h2").text().trim() ||
-                        anchor.text().trim()
-                    const href = anchor.attr("href") || ""
-
-                    if (!title || !href || !href.includes("/watch/")) return
-
-                    const id = href.split("/watch/").pop() || ""
-                    if (!id) return
-
-                    results.push({
-                        id: id,
-                        title: title,
-                        url: `${this.baseUrl}/watch/${id}`,
-                        subOrDub: "sub" as SubOrDub,
-                    })
-                },
-            )
-        }
 
         return results
     }
 
     // ─── Find Episodes ──────────────────────────────────────────────────
     async findEpisodes(id: string): Promise<EpisodeDetails[]> {
-        // Step 1: Load the anime detail page to get the data-id
+        // Load the watch page — episodes are rendered inline in the HTML
         const watchUrl = `${this.baseUrl}/watch/${id}`
-        const pageRes = await fetch(watchUrl, { headers: this.headers })
-        if (!pageRes.ok) return []
+        const res = await fetch(watchUrl)
+        if (!res.ok) return []
 
-        const pageHtml = await pageRes.text()
-        const $page = LoadDoc(pageHtml)
-
-        // The anime detail page has a data-id attribute on the episode list container
-        // Common selectors: #watch-main[data-id], .watch-section[data-id], [data-id]
-        let dataId =
-            $page("#watch-main").attr("data-id") ||
-            $page(".watch-main").attr("data-id") ||
-            $page("[data-id]").first().attr("data-id") ||
-            ""
-
-        // Alternative: try to extract from a script or data attribute
-        if (!dataId) {
-            const bodyHtml = pageHtml
-            const dataIdMatch = bodyHtml.match(/data-id="(\d+)"/)
-            if (dataIdMatch) {
-                dataId = dataIdMatch[1]
-            }
-        }
-
-        if (!dataId) {
-            console.warn("Could not find data-id for anime: " + id)
-            return []
-        }
-
-        // Step 2: Fetch episodes via AJAX endpoint
-        const ajaxUrl = `${this.baseUrl}/ajax/episode/list/${dataId}`
-        const ajaxRes = await fetch(ajaxUrl, {
-            headers: {
-                ...this.headers,
-                "X-Requested-With": "XMLHttpRequest",
-            },
-        })
-        if (!ajaxRes.ok) return []
-
-        // The AJAX endpoint returns JSON with an "html" field, or raw HTML
-        let episodeHtml = ""
-        const contentType = ajaxRes.headers.get("content-type") || ""
-
-        if (contentType.includes("json")) {
-            const jsonData = (await ajaxRes.json()) as { html?: string; result?: string }
-            episodeHtml = jsonData.html || jsonData.result || ""
-        } else {
-            episodeHtml = await ajaxRes.text()
-        }
-
-        if (!episodeHtml) return []
-
-        const $ep = LoadDoc(episodeHtml)
+        const html = res.text()
+        const $ = LoadDoc(html)
         const episodes: EpisodeDetails[] = []
 
-        // Episodes are typically listed as <a> or <li> elements with data-ids
-        $ep("a[data-id], .ep-item, .ssl-item").each((_: number, el: any) => {
-            const epDataId = $(el).attr("data-id") || $(el).attr("data-ids") || ""
-            const epNum =
-                $(el).attr("data-number") ||
-                $(el).attr("data-num") ||
-                $(el).find(".ssli-order, .ep-num").text().trim() ||
-                $(el).attr("data-ep") ||
-                ""
-            const epTitle =
-                $(el).attr("title") ||
-                $(el).find(".ep-name, .ssli-detail .ep-name").text().trim() ||
-                ""
+        // Episodes: ul.ep-range > li > a[data-num][href]
+        $(".ep-range li a").each((_: number, el: DocSelection) => {
+            const numStr = el.attr("data-num") || "0"
+            const num = parseInt(numStr, 10)
+            const href = el.attr("href") || ""
+            const title = el.parent().attr("title") || ""
 
-            const num = parseInt(epNum, 10)
-            if (!epDataId || isNaN(num)) return
+            if (isNaN(num) || num === 0) return
+
+            // Use the full path as the episode ID
+            const epPath = href.startsWith("/") ? href : `/watch/${id}/ep-${num}`
 
             episodes.push({
-                id: epDataId,
+                id: epPath,
                 number: num,
-                url: `${watchUrl}?ep=${epDataId}`,
-                title: epTitle || `Episode ${num}`,
+                url: `${this.baseUrl}${epPath}`,
+                title: title || `Episode ${num}`,
             })
         })
-
-        // Fallback: try alternative selectors
-        if (episodes.length === 0) {
-            $ep("li[data-id], .episode-item, [data-ep-id]").each((_: number, el: any) => {
-                const epDataId =
-                    $(el).attr("data-id") || $(el).attr("data-ep-id") || ""
-                const epNumText =
-                    $(el).attr("data-number") ||
-                    $(el).text().trim().match(/\d+/)?.[0] ||
-                    ""
-                const num = parseInt(epNumText, 10)
-
-                if (!epDataId || isNaN(num)) return
-
-                episodes.push({
-                    id: epDataId,
-                    number: num,
-                    url: `${watchUrl}?ep=${epDataId}`,
-                    title: `Episode ${num}`,
-                })
-            })
-        }
 
         // Sort by episode number
         episodes.sort((a, b) => a.number - b.number)
@@ -224,239 +128,53 @@ class Provider {
             videoSources: [],
         }
 
-        // Step 1: Fetch the server list for this episode
-        const serverListUrl = `${this.baseUrl}/ajax/server/list/${episode.id}`
-        const serverRes = await fetch(serverListUrl, {
-            headers: {
-                ...this.headers,
-                "X-Requested-With": "XMLHttpRequest",
-            },
-        })
-
-        if (!serverRes.ok) return result
-
-        let serverHtml = ""
-        const sContentType = serverRes.headers.get("content-type") || ""
-
-        if (sContentType.includes("json")) {
-            const jsonData = (await serverRes.json()) as { html?: string; result?: string }
-            serverHtml = jsonData.html || jsonData.result || ""
-        } else {
-            serverHtml = await serverRes.text()
-        }
-
-        if (!serverHtml) return result
-
-        const $srv = LoadDoc(serverHtml)
-
-        // Find the matching server by name
-        // Servers are typically listed with data-id attributes
-        let serverDataId = ""
-
-        // Check both sub and dub server sections
-        $srv(".server-item, [data-server-id], li[data-id]").each(
-            (_: number, el: any) => {
-                const srvName = (
-                    $(el).attr("data-server-name") ||
-                    $(el).find("a").text().trim() ||
-                    $(el).text().trim()
-                ).toLowerCase()
-                const srvId =
-                    $(el).attr("data-id") ||
-                    $(el).attr("data-server-id") ||
-                    $(el).find("a").attr("data-id") ||
-                    ""
-
-                if (srvName.includes(server.toLowerCase()) && srvId) {
-                    serverDataId = srvId
-                }
-            },
-        )
-
-        // If exact match not found, use the first available server
-        if (!serverDataId) {
-            const firstServer = $srv(
-                ".server-item[data-id], [data-server-id], li[data-id]",
-            ).first()
-            serverDataId =
-                firstServer.attr("data-id") ||
-                firstServer.attr("data-server-id") ||
-                ""
-        }
-
-        if (!serverDataId) {
-            console.warn("No server found for episode: " + episode.id)
-            return result
-        }
-
-        // Step 2: Fetch the video source for this server
-        const sourceUrl = `${this.baseUrl}/ajax/sources/${serverDataId}`
-        const sourceRes = await fetch(sourceUrl, {
-            headers: {
-                ...this.headers,
-                "X-Requested-With": "XMLHttpRequest",
-            },
-        })
-
-        if (!sourceRes.ok) return result
-
-        const sourceData = (await sourceRes.json()) as {
-            link?: string
-            result?: { url?: string; link?: string }
-            type?: string
-            server?: number
-            tracks?: Array<{ file: string; label: string; kind: string; default?: boolean }>
-        }
-
-        const embedUrl =
-            sourceData.link ||
-            sourceData.result?.url ||
-            sourceData.result?.link ||
-            ""
-
-        if (!embedUrl) return result
-
-        // Step 3: Try to extract the actual video URL from the embed
-        // The embed URL typically points to vidplay, megacloud, filemoon, etc.
-        const videoSources = await this.extractVideoSources(embedUrl)
-
-        // Add subtitles from tracks if available
-        const subtitles: VideoSubtitle[] = []
-        if (sourceData.tracks) {
-            sourceData.tracks.forEach(
-                (track: { file: string; label: string; kind: string; default?: boolean }, idx: number) => {
-                    if (track.kind === "captions" || track.kind === "subtitles") {
-                        subtitles.push({
-                            id: `sub-${idx}`,
-                            url: track.file,
-                            language: track.label || "Unknown",
-                            isDefault: track.default || false,
-                        })
-                    }
-                },
-            )
-        }
-
-        if (videoSources.length > 0) {
-            result.videoSources = videoSources.map((vs) => ({
-                ...vs,
-                subtitles: subtitles.length > 0 ? subtitles : vs.subtitles,
-            }))
-        } else {
-            // Fallback: return the embed URL as the source
-            // Seanime may be able to handle embed URLs directly
-            result.videoSources = [
-                {
-                    url: embedUrl,
-                    type: "m3u8" as VideoSourceType,
-                    quality: "auto",
-                    subtitles: subtitles,
-                },
-            ]
-        }
-
-        return result
-    }
-
-    // ─── Helper: Extract video sources from an embed URL ────────────────
-    private async extractVideoSources(embedUrl: string): Promise<VideoSource[]> {
-        const sources: VideoSource[] = []
+        // The data-link-id is encoded/compressed and requires the site's own JS to
+        // decode it into an embed URL. We use ChromeDP to load the page in a headless
+        // browser, click the desired server, and read the resulting iframe src.
+        const browser = await ChromeDP.newBrowser()
 
         try {
-            const res = await fetch(embedUrl, {
-                headers: {
-                    Referer: this.baseUrl,
-                    "User-Agent": this.headers["User-Agent"],
-                },
-            })
+            // Navigate to the episode page
+            const pageUrl = episode.url || `${this.baseUrl}${episode.id}`
+            await browser.navigate(pageUrl)
 
-            if (!res.ok) return sources
+            // Wait for the servers section to load
+            await browser.waitVisible(".servers .type li")
 
-            const html = await res.text()
+            // Map server name to sv-id
+            const serverLower = server.toLowerCase()
+            let svId = "4" // default to Vidplay
+            if (serverLower.includes("byfms")) svId = "1"
+            else if (serverLower.includes("dghg")) svId = "2"
+            else if (serverLower.includes("vidplay")) svId = "4"
 
-            // Look for m3u8 or mp4 URLs in the embed page source
-            // Pattern 1: Direct m3u8 URLs
-            const m3u8Matches = html.match(
-                /https?:\/\/[^\s"'\\]+\.m3u8[^\s"'\\]*/g,
+            // Click the server button (sub type)
+            const clickSelector = `.servers .type[data-type="sub"] li[data-sv-id="${svId}"]`
+            await browser.click(clickSelector)
+
+            // Wait for the iframe to appear
+            await browser.sleep(2000)
+            await browser.waitVisible("iframe")
+
+            // Extract the iframe src
+            const iframeSrc = await browser.evaluate(
+                `(function() { var f = document.querySelector('iframe'); return f ? f.src : ''; })()`
             )
-            if (m3u8Matches) {
-                m3u8Matches.forEach((url: string, idx: number) => {
-                    sources.push({
-                        url: url,
-                        type: "m3u8" as VideoSourceType,
-                        quality: idx === 0 ? "auto" : `source-${idx}`,
-                        subtitles: [],
-                    })
-                })
-            }
 
-            // Pattern 2: Direct mp4 URLs
-            const mp4Matches = html.match(
-                /https?:\/\/[^\s"'\\]+\.mp4[^\s"'\\]*/g,
-            )
-            if (mp4Matches) {
-                mp4Matches.forEach((url: string, idx: number) => {
-                    sources.push({
-                        url: url,
-                        type: "mp4" as VideoSourceType,
-                        quality: idx === 0 ? "720p" : `source-${idx}`,
-                        subtitles: [],
-                    })
-                })
-            }
-
-            // Pattern 3: JSON-encoded source objects
-            const jsonSourceMatch = html.match(
-                /sources\s*[:=]\s*(\[[\s\S]*?\])/,
-            )
-            if (jsonSourceMatch) {
-                try {
-                    const parsed = JSON.parse(jsonSourceMatch[1]) as Array<{
-                        file?: string
-                        src?: string
-                        url?: string
-                        type?: string
-                        label?: string
-                        quality?: string
-                    }>
-                    parsed.forEach((s) => {
-                        const fileUrl = s.file || s.src || s.url || ""
-                        if (!fileUrl) return
-
-                        let type: VideoSourceType = "unknown"
-                        if (fileUrl.includes(".m3u8")) type = "m3u8"
-                        else if (fileUrl.includes(".mp4")) type = "mp4"
-
-                        sources.push({
-                            url: fileUrl,
-                            type: type,
-                            quality: s.label || s.quality || "auto",
-                            subtitles: [],
-                        })
-                    })
-                } catch (_e) {
-                    // JSON parse failed, continue
-                }
-            }
-
-            // Pattern 4: Look for file/source in script tags
-            const fileMatch = html.match(/file\s*[:=]\s*["']([^"']+)["']/)
-            if (fileMatch && sources.length === 0) {
-                let type: VideoSourceType = "unknown"
-                if (fileMatch[1].includes(".m3u8")) type = "m3u8"
-                else if (fileMatch[1].includes(".mp4")) type = "mp4"
-
-                sources.push({
-                    url: fileMatch[1],
-                    type: type,
+            if (iframeSrc && typeof iframeSrc === "string" && iframeSrc.length > 0) {
+                result.videoSources.push({
+                    url: iframeSrc,
+                    type: "m3u8" as VideoSourceType,
                     quality: "auto",
                     subtitles: [],
                 })
             }
         } catch (e) {
-            console.error("Failed to extract video sources from embed: " + e)
+            console.error("ChromeDP error: " + e)
+        } finally {
+            await browser.close()
         }
 
-        return sources
+        return result
     }
 }
