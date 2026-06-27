@@ -2,7 +2,6 @@
   "id": "aniwaves-provider",
   "name": "Aniwaves",
   "description": "Online streaming provider for aniwaves.ru (aniwave). Provides search, episode listing, and video streaming from aniwaves.ru.",
-  "manifestURI": "",
   "version": "1.0.0",
   "author": "zZ",
   "type": "onlinestream-provider",
