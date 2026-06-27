@@ -2,6 +2,7 @@
   "id": "aniwaves-provider",
   "name": "Aniwaves",
   "description": "Online streaming provider for aniwaves.ru. Supports search, episode listing, and video streaming with sub and dub.",
+  "manifestURI": "https://raw.githubusercontent.com/Zzymnas/Aniwave/refs/heads/main/Aniwave/aniwaves-provider.json",
   "version": "1.1.0",
   "author": "zZ",
   "type": "onlinestream-provider",
